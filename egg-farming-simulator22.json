@@ -1,0 +1,164 @@
+{
+    "_comment": "DO NOT EDIT: FILE GENERATED AUTOMATICALLY BY PTERODACTYL PANEL - PTERODACTYL.IO",
+    "meta": {
+        "version": "PTDL_v2",
+        "update_url": null
+    },
+    "exported_at": "2026-07-18T13:19:31+02:00",
+    "name": "Farming Simulator 22",
+    "author": "admin@gamingduces.de",
+    "description": "FS22 Dedicated Server via SteamCMD (App-ID 1248130) + Wine. Start ueber dedicatedServer.exe (Webpanel). Erfordert eine zweite, lizenzierte Steam-Kopie des Spiels.",
+    "features": [
+        "steam_disk_space"
+    ],
+    "docker_images": {
+        "Wine": "ghcr.io/ptero-eggs/yolks:wine_latest"
+    },
+    "file_denylist": [],
+    "startup": "bash start.sh",
+    "config": {
+        "files": "{}",
+        "startup": "{\r\n    \"done\": \"Started network game\"\r\n}",
+        "logs": "{}",
+        "stop": "^C"
+    },
+    "scripts": {
+        "installation": {
+            "script": "#!/bin/bash\r\n## Image zum Installieren: ghcr.io/parkervcp/installers:debian\r\n\r\nif [[ \"${STEAM_USER}\" == \"\" ]] || [[ \"${STEAM_PASS}\" == \"\" ]]; then\r\n    echo -e \"FEHLER: STEAM_USER/STEAM_PASS sind Pflicht - FS22 hat keinen anonymen Login.\\n\"\r\n    exit 1\r\nfi\r\n\r\ncd /tmp\r\nmkdir -p /mnt/server/steamcmd\r\ncurl -sSL -o steamcmd.tar.gz https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz\r\ntar -xzvf steamcmd.tar.gz -C /mnt/server/steamcmd\r\nmkdir -p /mnt/server/steamapps\r\ncd /mnt/server/steamcmd\r\n\r\nchown -R root:root /mnt\r\nexport HOME=/mnt/server\r\n\r\n## Fehlende 32-bit Kompatibilitaetslibs nachinstallieren (haeufige Ursache fuer\r\n## Segfault direkt bei \"Waiting for client config...\" vor dem eigentlichen Download)\r\ndpkg --add-architecture i386\r\napt-get update\r\napt-get install -y lib32stdc++6 lib32z1\r\napt-get install -y libc6:i386 libstdc++6:i386 zlib1g:i386 || true\r\n\r\n## Schritt 1: Nur einloggen (eigene Session), damit der Client-Config-State sauber\r\n## persistiert. SteamCMD segfaultet bei \"Waiting for client config...\" beim BEENDEN,\r\n## der Login selbst ist aber erfolgreich - deshalb Exit-Code hier ignorieren.\r\necho \"-----------------------------------------\"\r\necho \"SteamCMD: Login-Session (Config-State aufbauen)...\"\r\necho \"-----------------------------------------\"\r\n./steamcmd.sh +login ${STEAM_USER} ${STEAM_PASS} $( [[ -n \"${STEAM_AUTH}\" ]] && printf '%s' \"${STEAM_AUTH}\" ) +quit || true\r\nsleep 5\r\n\r\n## Schritt 2: App-Update in getrennten Sessions, mit Retry. Erfolg wird an der\r\n## tatsaechlich heruntergeladenen exe geprueft, NICHT am Exit-Code (wegen Segfault-beim-Beenden).\r\nMAX_RETRIES=5\r\nRETRY=0\r\nwhile [ $RETRY -lt $MAX_RETRIES ]; do\r\n    RETRY=$((RETRY+1))\r\n    echo \"-----------------------------------------\"\r\n    echo \"SteamCMD: App-Update Versuch ${RETRY}/${MAX_RETRIES} (App ${SRCDS_APPID})...\"\r\n    echo \"-----------------------------------------\"\r\n    ./steamcmd.sh +force_install_dir /mnt/server +login ${STEAM_USER} ${STEAM_PASS} $( [[ -n \"${STEAM_AUTH}\" ]] && printf '%s' \"${STEAM_AUTH}\" ) +@sSteamCmdForcePlatformType windows +app_update ${SRCDS_APPID} validate +quit || true\r\n\r\n    if [ -f \"/mnt/server/dedicatedServer.exe\" ]; then\r\n        echo \"dedicatedServer.exe gefunden - Download erfolgreich.\"\r\n        break\r\n    fi\r\n    echo \"dedicatedServer.exe noch nicht vorhanden. Warte 20s und versuche es erneut...\"\r\n    sleep 20\r\ndone\r\n\r\nif [ ! -f \"/mnt/server/dedicatedServer.exe\" ]; then\r\n    echo \"FEHLER: dedicatedServer.exe nach ${MAX_RETRIES} Versuchen nicht vorhanden.\"\r\n    echo \"Pruefe STEAM_USER/STEAM_PASS und ob der Account die FS22-Lizenz besitzt.\"\r\n    exit 1\r\nfi\r\n\r\nmkdir -p /mnt/server/.steam/sdk32\r\ncp -v linux32/steamclient.so ../.steam/sdk32/steamclient.so 2>/dev/null || true\r\nmkdir -p /mnt/server/.steam/sdk64\r\ncp -v linux64/steamclient.so ../.steam/sdk64/steamclient.so 2>/dev/null || true\r\n\r\n## steam_appid.txt anlegen, damit die Steamworks-Initialisierung nicht ueber\r\n## das steam:// Protokoll laufen muss (kein echter Steam-Client im Container)\r\necho \"${SRCDS_APPID}\" > /mnt/server/steam_appid.txt\r\n\r\n## Profilordner vorab anlegen, damit dedicatedServer.exe ihn beim ersten Start nicht selbst erzeugen muss\r\nmkdir -p \"/mnt/server/.wine/drive_c/users/container/Documents/My Games/FarmingSimulator2022\"\r\n\r\n## Echten Steam-Client-Installer laden (wird beim ersten Start unter Wine installiert,\r\n## damit SteamAPI_IsSteamRunning() im Spiel wahrheitsgemaess \"ja\" meldet)\r\ncurl -sSL -o /mnt/server/SteamSetup.exe \"https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe\"\r\n\r\n## start.sh Wrapper erzeugen - macht Client-Install (einmalig), Client-Login (Hintergrund),\r\n## und startet danach Webpanel + eigentlichen Gameserver-Prozess\r\ncat > /mnt/server/start.sh << 'STARTEOF'\n#!/bin/bash\n# KEIN set -e - SteamCMD/Steam segfaulten beim Beenden, das darf das Script nicht killen.\n\nSTEAM_DIR=\"/home/container/.wine/drive_c/Program Files (x86)/Steam\"\nSTEAM_EXE=\"${STEAM_DIR}/steam.exe\"\nGAMELOG_DIR=\"/home/container/.wine/drive_c/users/container/Documents/My Games/FarmingSimulator2022\"\n\n## Ein einziges, langlebiges virtuelles Display fuer ALLE Wine-Prozesse.\n## (Mehrere parallele xvfb-run Instanzen killen sich gegenseitig -> \":99 broken\")\nexport DISPLAY=:99\nXvfb :99 -screen 0 1024x768x24 -nolisten tcp >/home/container/xvfb.log 2>&1 &\nsleep 3\n\n## 1) Steam-Client einmalig installieren, falls noch nicht vorhanden\nif [ ! -f \"${STEAM_EXE}\" ]; then\n    echo \"-----------------------------------------\"\n    echo \"Installiere echten Steam-Client (einmalig, dauert etwas)...\"\n    echo \"-----------------------------------------\"\n    wine /home/container/SteamSetup.exe /S\n    sleep 10\nfi\n\n## 2) Steam-Client starten (mit Neustart-Schleife wegen Selbst-Update-Shutdown).\n##    Login via Mobile Authenticator - beim ersten Mal in der Steam-App bestaetigen.\necho \"-----------------------------------------\"\necho \"Starte Steam-Client (${STEAM_USER})...\"\necho \"Falls Steam Guard eine App-Bestaetigung verlangt: jetzt in der Steam-App bestaetigen.\"\necho \"-----------------------------------------\"\n\nstart_steam() {\n    wine \"${STEAM_EXE}\" -silent -login \"${STEAM_USER}\" \"${STEAM_PASS}\" ${STEAM_AUTH} \\\n        -no-browser -tcp >/home/container/steamclient.log 2>&1 &\n    STEAM_PID=$!\n}\n\nstart_steam\n\nREADY=0\nfor i in $(seq 1 30); do\n    sleep 10\n    if ! kill -0 \"${STEAM_PID}\" 2>/dev/null; then\n        echo \"Steam-Client hat sich beendet (vermutlich nach Selbst-Update) - starte neu...\"\n        start_steam\n        continue\n    fi\n    if [ -f \"${STEAM_DIR}/config/loginusers.vdf\" ] && grep -qi \"${STEAM_USER}\" \"${STEAM_DIR}/config/loginusers.vdf\" 2>/dev/null; then\n        echo \"Steam-Client scheint eingeloggt (loginusers.vdf gefunden).\"\n        READY=1\n        sleep 15\n        break\n    fi\ndone\n\nif [ \"${READY}\" -eq 0 ]; then\n    echo \"WARNUNG: Steam-Client-Login konnte nicht sicher bestaetigt werden.\"\nfi\n\n## 3) Webpanel (dedicatedServer.exe) starten. Der eigentliche Spielprozess wird\n##    VOM Webpanel gestartet (Klick auf Start im Browser), nicht direkt hier.\ncd /home/container\n\n## Alte Logs zur Seite raeumen, damit wir das FRISCHE Log erwischen\nmkdir -p \"${GAMELOG_DIR}/old_logs\"\nmv \"${GAMELOG_DIR}\"/log_*.txt \"${GAMELOG_DIR}/old_logs/\" 2>/dev/null || true\n\nwine ./dedicatedServer.exe > /home/container/webpanel.log 2>&1 &\nPANEL_PID=$!\n\necho \"Webpanel laeuft. Bitte im Browser (Port ${WEB_PORT}) den Server starten.\"\necho \"Warte auf frisches GIANTS-Server-Log (entsteht beim Start ueber das Webpanel)...\"\n\n## Alte Logs sind weggeraeumt -> das Auftauchen einer log_*.txt ist der zuverlaessige Trigger.\nwhile kill -0 ${PANEL_PID} 2>/dev/null; do\n    NEWEST_LOG=$(ls -t \"${GAMELOG_DIR}\"/log_*.txt 2>/dev/null | head -1)\n    if [ -n \"${NEWEST_LOG}\" ]; then\n        echo \"Server-Log gefunden: ${NEWEST_LOG}\"\n        tail -n +1 -f \"${NEWEST_LOG}\" &\n        break\n    fi\n    sleep 3\ndone\n\n## Container am Leben halten, solange das Webpanel laeuft\nwait ${PANEL_PID}\nSTARTEOF\nchmod +x /mnt/server/start.sh\r\n\r\nXML=/mnt/server/dedicatedServer.xml\r\nif [ -f \"$XML\" ]; then\r\n    echo \"Patche dedicatedServer.xml ...\"\r\n    sed -i -E \"s/<webserver port=\\\"[0-9]+\\\">/<webserver port=\\\"${WEB_PORT}\\\">/\" \"$XML\"\r\n    sed -i -E \"s#<username>.*</username>#<username>${WEB_USER}</username>#\" \"$XML\"\r\n    sed -i -E \"s#<passphrase>.*</passphrase>#<passphrase>${WEB_PASS}</passphrase>#\" \"$XML\"\r\n    sed -i -E \"s/<tls port=\\\"[0-9]+\\\" active=\\\"/<tls port=\\\"${WEB_PORT}\\\" active=\\\"/\" \"$XML\"\r\n    sed -i -E \"s/(<tls port=\\\"[0-9]+\\\" active=\\\")true(\\\">)/\\1false\\2/\" \"$XML\"\r\nelse\r\n    echo \"WARNUNG: dedicatedServer.xml wurde nicht gefunden, bitte manuell pruefen und Zugangsdaten setzen.\"\r\nfi\r\n\r\necho \"-----------------------------------------\"\r\necho \"Install fertig. Webpanel-Login: ${WEB_USER} / (gesetztes Passwort), Port ${WEB_PORT}\"\r\necho \"Spielport muss im Webpanel selbst gesetzt werden und zur Pterodactyl-Allocation passen.\"\r\necho \"-----------------------------------------\"",
+            "container": "ghcr.io/parkervcp/installers:debian",
+            "entrypoint": "/bin/bash"
+        }
+    },
+    "variables": [
+        {
+            "name": "Steam Benutzername",
+            "description": "Account mit gueltiger zweiter FS22-Lizenz.",
+            "env_variable": "STEAM_USER",
+            "default_value": "steamuser",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string",
+            "field_type": "text"
+        },
+        {
+            "name": "Steam Passwort",
+            "description": "Passwort des obigen Accounts.",
+            "env_variable": "STEAM_PASS",
+            "default_value": "changeme",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string",
+            "field_type": "text"
+        },
+        {
+            "name": "GameServerPort",
+            "description": "Port fuer den eigentlichen Gameserver. Muss zusaetzlich im Webpanel identisch gesetzt werden.",
+            "env_variable": "GAME_PORT",
+            "default_value": "10823",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|integer|between:1024,65535",
+            "field_type": "text"
+        },
+        {
+            "name": "Webpanel-Port",
+            "description": "Port fuer das dedicatedServer.exe Webinterface (HTTP, TLS wird deaktiviert).",
+            "env_variable": "WEB_PORT",
+            "default_value": "8080",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|integer|between:1024,65535",
+            "field_type": "text"
+        },
+        {
+            "name": "Webpanel-Benutzername",
+            "description": "Login fuer das Webinterface.",
+            "env_variable": "WEB_USER",
+            "default_value": "admin",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|max:32",
+            "field_type": "text"
+        },
+        {
+            "name": "Webpanel-Passwort",
+            "description": "Passwort/Passphrase fuer das Webinterface.",
+            "env_variable": "WEB_PASS",
+            "default_value": "changeme123",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "SRCDS_APPID",
+            "description": "Steam App-ID von Farming Simulator 22.",
+            "env_variable": "SRCDS_APPID",
+            "default_value": "1248130",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "required|string|in:1248130",
+            "field_type": "text"
+        },
+        {
+            "name": "WINEDEBUG",
+            "description": "",
+            "env_variable": "WINEDEBUG",
+            "default_value": "-all",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "required|string|max:20",
+            "field_type": "text"
+        },
+        {
+            "name": "WINEARCH",
+            "description": "",
+            "env_variable": "WINEARCH",
+            "default_value": "win64",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "required|string|in:win64",
+            "field_type": "text"
+        },
+        {
+            "name": "WINETRICKS_RUN",
+            "description": "Installiert benoetigte VC++ Runtime/Fonts im Wine-Prefix vor dem Start.",
+            "env_variable": "WINETRICKS_RUN",
+            "default_value": "vcrun2019 corefonts d3dcompiler_47",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "required|string",
+            "field_type": "text"
+        },
+        {
+            "name": "Server Name",
+            "description": "Name des Servers, wird beim direkten Start an FarmingSimulator2022Game.exe uebergeben (-name).",
+            "env_variable": "SERVER_NAME",
+            "default_value": "FarmingSimulator2022",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|max:32",
+            "field_type": "text"
+        },
+        {
+            "name": "WINEPATH",
+            "description": "",
+            "env_variable": "WINEPATH",
+            "default_value": "/home/container",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "required|string|max:32",
+            "field_type": "text"
+        },
+        {
+            "name": "Steam Guard Code",
+            "description": "Falls aktiv: aktueller Code aus E-Mail/App. Wird zwischen Installs NICHT gespeichert.\r\n\r\nAktuell nicht nutzbar, Mobile Steamguard vorrausgesetzt.",
+            "env_variable": "STEAM_AUTH",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "nullable|string",
+            "field_type": "text"
+        }
+    ]
+}
